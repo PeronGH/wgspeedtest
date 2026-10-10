@@ -20,3 +20,5 @@ Flags must come before the URL:
 - `-v` verbose WireGuard logging
 
 The config needs a `DNS` entry if the URL uses a hostname, since name resolution happens inside the tunnel.
+
+For Cloudflare WARP, add `Reserved = 32, 165, 72` or `ClientId = IKVI` (base64) to `[Peer]` to send the client id in the reserved header bytes.

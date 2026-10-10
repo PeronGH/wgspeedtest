@@ -18,6 +18,8 @@ type Config struct {
 	DNS        []netip.Addr
 	MTU        int
 	Peers      []Peer
+	// Reserved is set from a WARP Reserved/ClientId key in [Peer]; nil means standard WireGuard.
+	Reserved *[3]byte
 }
 
 type Peer struct {
@@ -65,6 +67,9 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			err = cfg.set(key, value)
 		case "peer":
 			err = peer.set(key, value)
+			if err == nil && (key == "reserved" || key == "clientid") {
+				cfg.Reserved, err = parseReserved(key, value)
+			}
 		default:
 			err = fmt.Errorf("key outside of [Interface] or [Peer]")
 		}
@@ -183,4 +188,33 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// parseReserved accepts "Reserved = 32, 165, 72" (brackets optional) or the base64
+// "ClientId = IKVI" that WARP issues.
+func parseReserved(key, value string) (*[3]byte, error) {
+	var r [3]byte
+	if key == "clientid" {
+		b, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, err
+		}
+		if len(b) != 3 {
+			return nil, fmt.Errorf("client id must decode to 3 bytes, got %d", len(b))
+		}
+		copy(r[:], b)
+		return &r, nil
+	}
+	items := splitList(strings.Trim(value, "[]"))
+	if len(items) != 3 {
+		return nil, fmt.Errorf("expected 3 bytes, got %d", len(items))
+	}
+	for i, s := range items {
+		v, err := strconv.ParseUint(s, 10, 8)
+		if err != nil {
+			return nil, err
+		}
+		r[i] = byte(v)
+	}
+	return &r, nil
 }

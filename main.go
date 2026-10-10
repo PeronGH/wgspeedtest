@@ -130,7 +130,11 @@ func startTunnel(cfg *Config, verbose bool) (*netstack.Net, error) {
 	if verbose {
 		logLevel = device.LogLevelVerbose
 	}
-	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), device.NewLogger(logLevel, "wireguard: "))
+	bind := conn.NewDefaultBind()
+	if cfg.Reserved != nil {
+		bind = &reservedBind{Bind: bind, reserved: *cfg.Reserved}
+	}
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(logLevel, "wireguard: "))
 	if err := dev.IpcSet(uapi); err != nil {
 		return nil, err
 	}
