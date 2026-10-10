@@ -10,12 +10,13 @@ wgspeedtest -f wg.conf
 wgspeedtest -f wg.conf -d 5s 'https://speed.cloudflare.com/__down?bytes=100000000'
 ```
 
-It downloads for `-d` (default 10s) and prints the speed. The URL defaults to `https://mensura.cdn-apple.com/api/v1/gm/large`.
+It downloads for `-d` (default 10s) and prints one result line per endpoint. The URL defaults to `https://mensura.cdn-apple.com/api/v1/gm/large`.
 
 Flags must come before the URL:
 
 - `-f` WireGuard config file (required)
-- `-d` download duration (default `10s`)
+- `-e` endpoint list file: one `host:port` per line (`#` comments allowed); each endpoint replaces the config's `Endpoint` and is tested in turn
+- `-d` download duration per test (default `10s`)
 - `-timeout` time limit until response headers arrive (default `10s`)
 - `-v` verbose WireGuard logging
 

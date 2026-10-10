@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -17,9 +20,17 @@ import (
 
 const defaultURL = "https://mensura.cdn-apple.com/api/v1/gm/large"
 
+type options struct {
+	url      string
+	duration time.Duration
+	timeout  time.Duration
+	verbose  bool
+}
+
 func main() {
 	confPath := flag.String("f", "", "WireGuard config file (wg-quick format)")
-	duration := flag.Duration("d", 10*time.Second, "download duration")
+	endpointsPath := flag.String("e", "", "file with one endpoint (host:port) per line to test in turn")
+	duration := flag.Duration("d", 10*time.Second, "download duration per test")
 	timeout := flag.Duration("timeout", 10*time.Second, "time limit until the response headers arrive")
 	verbose := flag.Bool("v", false, "verbose WireGuard logging")
 	flag.Usage = func() {
@@ -31,65 +42,146 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	url := defaultURL
+	opts := options{url: defaultURL, duration: *duration, timeout: *timeout, verbose: *verbose}
 	if flag.NArg() == 1 {
-		url = flag.Arg(0)
+		opts.url = flag.Arg(0)
 	}
 
-	if err := run(*confPath, url, *duration, *timeout, *verbose); err != nil {
+	ok, err := run(*confPath, *endpointsPath, opts)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if !ok {
 		os.Exit(1)
 	}
 }
 
-func run(confPath, url string, duration, timeout time.Duration, verbose bool) error {
-	f, err := os.Open(confPath)
+// run tests every endpoint and reports whether all of them succeeded.
+func run(confPath, endpointsPath string, opts options) (bool, error) {
+	cfg, err := loadConfig(confPath)
 	if err != nil {
-		return err
-	}
-	cfg, err := ParseConfig(f)
-	f.Close()
-	if err != nil {
-		return fmt.Errorf("%s: %w", confPath, err)
+		return false, err
 	}
 
-	tnet, err := startTunnel(cfg, verbose)
-	if err != nil {
-		return err
-	}
-
-	// The tunnel and connection are deliberately not closed: the process exits right
-	// after reporting, and teardown through netstack can block.
-	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}}
-	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(nil)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
+	endpoints := []string{cfg.Peers[0].Endpoint}
+	if endpointsPath != "" {
+		if endpoints, err = loadEndpoints(endpointsPath); err != nil {
+			return false, err
+		}
 	}
 
 	st := newStatus(os.Stderr)
-	defer st.clear()
+	width := 0
+	for _, ep := range endpoints {
+		width = max(width, len(ep))
+	}
+	allOK := true
+	for _, ep := range endpoints {
+		label := fmt.Sprintf("%-*s", width, ep)
+		res, err := speedTest(withEndpoint(cfg, ep), opts, func(s string) { st.set(label + "  " + s) })
+		st.clear()
+		if err != nil {
+			allOK = false
+			fmt.Printf("%s  error: %v\n", label, err)
+			continue
+		}
+		fmt.Printf("%s  ttfb %6v  %8.2f MB in %4.1fs  %7.2f Mbps\n", label,
+			res.ttfb.Round(time.Millisecond), float64(res.bytes)/1e6, res.elapsed.Seconds(), mbps(res.bytes, res.elapsed))
+	}
+	return allOK, nil
+}
+
+func loadConfig(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	cfg, err := ParseConfig(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+func loadEndpoints(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var endpoints []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line, _, _ := strings.Cut(scanner.Text(), "#")
+		if line = strings.TrimSpace(line); line != "" {
+			endpoints = append(endpoints, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("%s: no endpoints", path)
+	}
+	return endpoints, nil
+}
+
+func withEndpoint(cfg *Config, endpoint string) *Config {
+	c := *cfg
+	c.Peers = slices.Clone(cfg.Peers)
+	for i := range c.Peers {
+		c.Peers[i].Endpoint = endpoint
+	}
+	return &c
+}
+
+type result struct {
+	ttfb    time.Duration
+	bytes   int64
+	elapsed time.Duration
+}
+
+func speedTest(cfg *Config, opts options, progress func(string)) (result, error) {
+	tnet, dev, err := startTunnel(cfg, opts.verbose)
+	if err != nil {
+		return result{}, err
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	// Teardown runs in the background so a stuck netstack connection cannot stall the next test.
+	defer func() {
+		go func() {
+			cancel(nil)
+			dev.Close()
+		}()
+	}()
+
+	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, opts.url, nil)
+	if err != nil {
+		return result{}, err
+	}
 
 	start := time.Now()
-	st.set("connecting...")
-	headerTimer := time.AfterFunc(timeout, func() {
-		cancel(fmt.Errorf("no response within %v (WireGuard handshake failed?)", timeout))
+	progress("connecting...")
+	headerTimer := time.AfterFunc(opts.timeout, func() {
+		cancel(fmt.Errorf("no response within %v (WireGuard handshake failed?)", opts.timeout))
 	})
 	resp, err := client.Do(req)
 	if err != nil {
 		if cause := context.Cause(ctx); cause != nil {
-			return cause
+			return result{}, cause
 		}
-		return err
+		return result{}, err
 	}
 	headerTimer.Stop()
 	ttfb := time.Since(start)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %s", resp.Status)
+		return result{}, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
-	st.set("downloading...")
+	progress("downloading...")
 	var received byteCounter
 	done := make(chan error, 1)
 	bodyStart := time.Now()
@@ -97,37 +189,28 @@ func run(confPath, url string, duration, timeout time.Duration, verbose bool) er
 		_, err := io.Copy(&received, resp.Body)
 		done <- err
 	}()
-	deadline := time.After(duration)
+	deadline := time.After(opts.duration)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	var lastBytes int64
 	lastTick := bodyStart
-loop:
 	for {
 		select {
 		case err := <-done:
 			if err != nil {
-				return err
+				return result{}, err
 			}
-			break loop
+			return result{ttfb, received.Load(), time.Since(bodyStart)}, nil
 		case <-deadline:
-			break loop
+			return result{ttfb, received.Load(), time.Since(bodyStart)}, nil
 		case now := <-ticker.C:
 			n := received.Load()
-			st.set(fmt.Sprintf("%4.1fs / %v  %8.2f MB  now %7.2f Mbps  avg %7.2f Mbps",
-				now.Sub(bodyStart).Seconds(), duration, float64(n)/1e6,
+			progress(fmt.Sprintf("%4.1fs / %v  %8.2f MB  now %7.2f Mbps  avg %7.2f Mbps",
+				now.Sub(bodyStart).Seconds(), opts.duration, float64(n)/1e6,
 				mbps(n-lastBytes, now.Sub(lastTick)), mbps(n, now.Sub(bodyStart))))
 			lastBytes, lastTick = n, now
 		}
 	}
-	elapsed := time.Since(bodyStart)
-	n := received.Load()
-	st.clear()
-
-	fmt.Printf("time to first byte: %v\n", ttfb.Round(time.Millisecond))
-	fmt.Printf("downloaded %.2f MB in %v\n", float64(n)/1e6, elapsed.Round(time.Millisecond))
-	fmt.Printf("speed: %.2f Mbps\n", mbps(n, elapsed))
-	return nil
 }
 
 func mbps(bytes int64, d time.Duration) float64 {
@@ -141,15 +224,15 @@ func (c *byteCounter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func startTunnel(cfg *Config, verbose bool) (*netstack.Net, error) {
+func startTunnel(cfg *Config, verbose bool) (*netstack.Net, *device.Device, error) {
 	uapi, err := cfg.UAPI()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	tunDev, tnet, err := netstack.CreateNetTUN(cfg.Addresses, cfg.DNS, cfg.MTU)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	logLevel := device.LogLevelError
@@ -162,7 +245,12 @@ func startTunnel(cfg *Config, verbose bool) (*netstack.Net, error) {
 	}
 	dev := device.NewDevice(tunDev, bind, device.NewLogger(logLevel, "wireguard: "))
 	if err := dev.IpcSet(uapi); err != nil {
-		return nil, err
+		go dev.Close()
+		return nil, nil, err
 	}
-	return tnet, dev.Up()
+	if err := dev.Up(); err != nil {
+		go dev.Close()
+		return nil, nil, err
+	}
+	return tnet, dev, nil
 }
