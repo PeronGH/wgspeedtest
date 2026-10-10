@@ -15,7 +15,7 @@ It downloads for `-d` (default 10s) and prints one result line per endpoint. The
 Flags must come before the URL:
 
 - `-f` WireGuard config file (required)
-- `-e` endpoint list file: one `host:port` per line (`#` comments allowed); each endpoint replaces the config's `Endpoint` and is tested in turn
+- `-e` endpoint list file: one `host:port` per line (`#` comments allowed); each endpoint replaces the config's `Endpoint` and is tested in turn. Append `:N` (e.g. `-e list.txt:10`) to start at line N; results are prefixed with their line number
 - `-d` download duration per test (default `10s`)
 - `-timeout` time limit until response headers arrive (default `10s`)
 - `-v` verbose WireGuard logging

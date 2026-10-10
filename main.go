@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -29,7 +30,7 @@ type options struct {
 
 func main() {
 	confPath := flag.String("f", "", "WireGuard config file (wg-quick format)")
-	endpointsPath := flag.String("e", "", "file with one endpoint (host:port) per line to test in turn")
+	endpointsPath := flag.String("e", "", "file with one endpoint (host:port) per line to test in turn; append :N to start at line N")
 	duration := flag.Duration("d", 10*time.Second, "download duration per test")
 	timeout := flag.Duration("timeout", 10*time.Second, "time limit until the response headers arrive")
 	verbose := flag.Bool("v", false, "verbose WireGuard logging")
@@ -64,7 +65,7 @@ func run(confPath, endpointsPath string, opts options) (bool, error) {
 		return false, err
 	}
 
-	endpoints := []string{cfg.Peers[0].Endpoint}
+	endpoints := []endpoint{{addr: cfg.Peers[0].Endpoint}}
 	if endpointsPath != "" {
 		if endpoints, err = loadEndpoints(endpointsPath); err != nil {
 			return false, err
@@ -72,14 +73,18 @@ func run(confPath, endpointsPath string, opts options) (bool, error) {
 	}
 
 	st := newStatus(os.Stderr)
-	width := 0
+	addrWidth, lineWidth := 0, 0
 	for _, ep := range endpoints {
-		width = max(width, len(ep))
+		addrWidth = max(addrWidth, len(ep.addr))
+		lineWidth = max(lineWidth, len(strconv.Itoa(ep.line)))
 	}
 	allOK := true
 	for _, ep := range endpoints {
-		label := fmt.Sprintf("%-*s", width, ep)
-		res, err := speedTest(withEndpoint(cfg, ep), opts, func(s string) { st.set(label + "  " + s) })
+		label := fmt.Sprintf("%-*s", addrWidth, ep.addr)
+		if ep.line > 0 {
+			label = fmt.Sprintf("%*d  %s", lineWidth, ep.line, label)
+		}
+		res, err := speedTest(withEndpoint(cfg, ep.addr), opts, func(s string) { st.set(label + "  " + s) })
 		st.clear()
 		if err != nil {
 			allOK = false
@@ -105,25 +110,41 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func loadEndpoints(path string) ([]string, error) {
+// endpoint is an address to test; line is its 1-based line in the endpoint file, or 0.
+type endpoint struct {
+	addr string
+	line int
+}
+
+// loadEndpoints reads an endpoint file. A ":N" suffix on the path starts at line N.
+func loadEndpoints(path string) ([]endpoint, error) {
+	startLine := 1
+	if i := strings.LastIndex(path, ":"); i >= 0 {
+		if n, err := strconv.Atoi(path[i+1:]); err == nil && n > 0 {
+			path, startLine = path[:i], n
+		}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	var endpoints []string
+	var endpoints []endpoint
 	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		if lineNo < startLine {
+			continue
+		}
 		line, _, _ := strings.Cut(scanner.Text(), "#")
 		if line = strings.TrimSpace(line); line != "" {
-			endpoints = append(endpoints, line)
+			endpoints = append(endpoints, endpoint{addr: line, line: lineNo})
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("%s: no endpoints", path)
+		return nil, fmt.Errorf("%s: no endpoints from line %d", path, startLine)
 	}
 	return endpoints, nil
 }
