@@ -94,11 +94,12 @@ func (c *Config) set(key, value string) (err error) {
 		c.PrivateKey, err = keyToHex(value)
 	case "address":
 		for _, s := range splitList(value) {
-			var p netip.Prefix
-			if p, err = netip.ParsePrefix(s); err != nil {
+			addr, _, _ := strings.Cut(s, "/")
+			var a netip.Addr
+			if a, err = netip.ParseAddr(addr); err != nil {
 				return err
 			}
-			c.Addresses = append(c.Addresses, p.Addr())
+			c.Addresses = append(c.Addresses, a)
 		}
 	case "dns":
 		// Non-IP entries are search domains in wg-quick; they are irrelevant here.
