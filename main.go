@@ -23,15 +23,17 @@ const defaultURL = "https://mensura.cdn-apple.com/api/v1/gm/large"
 
 type options struct {
 	url      string
-	duration time.Duration
-	timeout  time.Duration
-	verbose  bool
+	duration  time.Duration
+	earlyStop time.Duration
+	timeout   time.Duration
+	verbose   bool
 }
 
 func main() {
 	confPath := flag.String("f", "", "WireGuard config file (wg-quick format)")
 	endpointsPath := flag.String("e", "", "file with one endpoint (host:port) per line to test in turn; append :N to start at line N")
 	duration := flag.Duration("d", 10*time.Second, "download duration per test")
+	earlyStop := flag.Duration("early", 2*time.Second, "after this, stop a test once a second is slower than the one before (0 disables)")
 	timeout := flag.Duration("timeout", 10*time.Second, "time limit until the response headers arrive")
 	verbose := flag.Bool("v", false, "verbose WireGuard logging")
 	flag.Usage = func() {
@@ -43,7 +45,7 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	opts := options{url: defaultURL, duration: *duration, timeout: *timeout, verbose: *verbose}
+	opts := options{url: defaultURL, duration: *duration, earlyStop: *earlyStop, timeout: *timeout, verbose: *verbose}
 	if flag.NArg() == 1 {
 		opts.url = flag.Arg(0)
 	}
@@ -213,6 +215,14 @@ func speedTest(cfg *Config, opts options, progress func(string)) (result, error)
 	deadline := time.After(opts.duration)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	var secTick <-chan time.Time
+	if opts.earlyStop > 0 {
+		secTicker := time.NewTicker(time.Second)
+		defer secTicker.Stop()
+		secTick = secTicker.C
+	}
+	var secs, secBytes int64
+	prevSecRate := int64(-1)
 	var lastBytes int64
 	lastTick := bodyStart
 	for {
@@ -224,6 +234,19 @@ func speedTest(cfg *Config, opts options, progress func(string)) (result, error)
 			return result{ttfb, received.Load(), time.Since(bodyStart)}, nil
 		case <-deadline:
 			return result{ttfb, received.Load(), time.Since(bodyStart)}, nil
+		case <-secTick:
+			// Only whole seconds that start after the early-stop point are compared.
+			secs++
+			n := received.Load()
+			rate := n - secBytes
+			secBytes = n
+			if time.Duration(secs-1)*time.Second < opts.earlyStop {
+				continue
+			}
+			if prevSecRate >= 0 && rate < prevSecRate {
+				return result{ttfb, n, time.Since(bodyStart)}, nil
+			}
+			prevSecRate = rate
 		case now := <-ticker.C:
 			n := received.Load()
 			progress(fmt.Sprintf("%4.1fs / %v  %8.2f MB  now %7.2f Mbps  avg %7.2f Mbps",
