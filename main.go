@@ -68,7 +68,11 @@ func run(confPath, url string, duration, timeout time.Duration, verbose bool) er
 		return err
 	}
 
+	st := newStatus(os.Stderr)
+	defer st.clear()
+
 	start := time.Now()
+	st.set("connecting...")
 	headerTimer := time.AfterFunc(timeout, func() {
 		cancel(fmt.Errorf("no response within %v (WireGuard handshake failed?)", timeout))
 	})
@@ -85,6 +89,7 @@ func run(confPath, url string, duration, timeout time.Duration, verbose bool) er
 		return fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
+	st.set("downloading...")
 	var received byteCounter
 	done := make(chan error, 1)
 	bodyStart := time.Now()
@@ -92,20 +97,41 @@ func run(confPath, url string, duration, timeout time.Duration, verbose bool) er
 		_, err := io.Copy(&received, resp.Body)
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			return err
+	deadline := time.After(duration)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	var lastBytes int64
+	lastTick := bodyStart
+loop:
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+			break loop
+		case <-deadline:
+			break loop
+		case now := <-ticker.C:
+			n := received.Load()
+			st.set(fmt.Sprintf("%4.1fs / %v  %8.2f MB  now %7.2f Mbps  avg %7.2f Mbps",
+				now.Sub(bodyStart).Seconds(), duration, float64(n)/1e6,
+				mbps(n-lastBytes, now.Sub(lastTick)), mbps(n, now.Sub(bodyStart))))
+			lastBytes, lastTick = n, now
 		}
-	case <-time.After(duration):
 	}
 	elapsed := time.Since(bodyStart)
 	n := received.Load()
+	st.clear()
 
 	fmt.Printf("time to first byte: %v\n", ttfb.Round(time.Millisecond))
 	fmt.Printf("downloaded %.2f MB in %v\n", float64(n)/1e6, elapsed.Round(time.Millisecond))
-	fmt.Printf("speed: %.2f Mbps\n", float64(n)*8/1e6/elapsed.Seconds())
+	fmt.Printf("speed: %.2f Mbps\n", mbps(n, elapsed))
 	return nil
+}
+
+func mbps(bytes int64, d time.Duration) float64 {
+	return float64(bytes) * 8 / 1e6 / d.Seconds()
 }
 
 type byteCounter struct{ atomic.Int64 }
