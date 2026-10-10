@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -14,27 +15,34 @@ import (
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
+const defaultURL = "https://mensura.cdn-apple.com/api/v1/gm/large"
+
 func main() {
 	confPath := flag.String("f", "", "WireGuard config file (wg-quick format)")
-	timeout := flag.Duration("timeout", 30*time.Second, "time limit until the response headers arrive")
+	duration := flag.Duration("d", 10*time.Second, "download duration")
+	timeout := flag.Duration("timeout", 10*time.Second, "time limit until the response headers arrive")
 	verbose := flag.Bool("v", false, "verbose WireGuard logging")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: %s -f wg.conf [flags] URL\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: %s -f wg.conf [flags] [URL]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *confPath == "" || flag.NArg() != 1 {
+	if *confPath == "" || flag.NArg() > 1 {
 		flag.Usage()
 		os.Exit(2)
 	}
+	url := defaultURL
+	if flag.NArg() == 1 {
+		url = flag.Arg(0)
+	}
 
-	if err := run(*confPath, flag.Arg(0), *timeout, *verbose); err != nil {
+	if err := run(*confPath, url, *duration, *timeout, *verbose); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(confPath, url string, timeout time.Duration, verbose bool) error {
+func run(confPath, url string, duration, timeout time.Duration, verbose bool) error {
 	f, err := os.Open(confPath)
 	if err != nil {
 		return err
@@ -45,12 +53,13 @@ func run(confPath, url string, timeout time.Duration, verbose bool) error {
 		return fmt.Errorf("%s: %w", confPath, err)
 	}
 
-	tnet, closeTunnel, err := startTunnel(cfg, verbose)
+	tnet, err := startTunnel(cfg, verbose)
 	if err != nil {
 		return err
 	}
-	defer closeTunnel()
 
+	// The tunnel and connection are deliberately not closed: the process exits right
+	// after reporting, and teardown through netstack can block.
 	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
@@ -71,18 +80,27 @@ func run(confPath, url string, timeout time.Duration, verbose bool) error {
 		return err
 	}
 	headerTimer.Stop()
-	defer resp.Body.Close()
 	ttfb := time.Since(start)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
+	var received byteCounter
+	done := make(chan error, 1)
 	bodyStart := time.Now()
-	n, err := io.Copy(io.Discard, resp.Body)
-	elapsed := time.Since(bodyStart)
-	if err != nil {
-		return err
+	go func() {
+		_, err := io.Copy(&received, resp.Body)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+	case <-time.After(duration):
 	}
+	elapsed := time.Since(bodyStart)
+	n := received.Load()
 
 	fmt.Printf("time to first byte: %v\n", ttfb.Round(time.Millisecond))
 	fmt.Printf("downloaded %.2f MB in %v\n", float64(n)/1e6, elapsed.Round(time.Millisecond))
@@ -90,15 +108,22 @@ func run(confPath, url string, timeout time.Duration, verbose bool) error {
 	return nil
 }
 
-func startTunnel(cfg *Config, verbose bool) (*netstack.Net, func(), error) {
+type byteCounter struct{ atomic.Int64 }
+
+func (c *byteCounter) Write(p []byte) (int, error) {
+	c.Add(int64(len(p)))
+	return len(p), nil
+}
+
+func startTunnel(cfg *Config, verbose bool) (*netstack.Net, error) {
 	uapi, err := cfg.UAPI()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	tunDev, tnet, err := netstack.CreateNetTUN(cfg.Addresses, cfg.DNS, cfg.MTU)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	logLevel := device.LogLevelError
@@ -107,12 +132,7 @@ func startTunnel(cfg *Config, verbose bool) (*netstack.Net, func(), error) {
 	}
 	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), device.NewLogger(logLevel, "wireguard: "))
 	if err := dev.IpcSet(uapi); err != nil {
-		dev.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	if err := dev.Up(); err != nil {
-		dev.Close()
-		return nil, nil, err
-	}
-	return tnet, dev.Close, nil
+	return tnet, dev.Up()
 }
